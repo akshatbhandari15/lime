@@ -114,6 +114,92 @@ class TableDomainMapper(explanation.DomainMapper):
         return ret
 
 
+from lime import explanation
+from lime import lime_base
+class TableDomainMapper(explanation.DomainMapper):
+    """Maps feature ids to names, generates table views, etc"""
+
+    def __init__(self, feature_names, feature_values, scaled_row,
+                 categorical_features, discretized_feature_names=None,
+                 feature_indexes=None):
+        """Init.
+        Args:
+            feature_names: list of feature names, in order
+            feature_values: list of strings with the values of the original row
+            scaled_row: scaled row
+            categorical_features: list of categorical features ids (ints)
+            feature_indexes: optional feature indexes used in the sparse case
+        """
+        self.exp_feature_names = feature_names
+        self.discretized_feature_names = discretized_feature_names
+        self.feature_names = feature_names
+        self.feature_values = feature_values
+        self.feature_indexes = feature_indexes
+        self.scaled_row = scaled_row
+        if sp.sparse.issparse(scaled_row):
+            self.all_categorical = False
+        else:
+            self.all_categorical = len(categorical_features) == len(scaled_row)
+        self.categorical_features = categorical_features
+
+    def map_exp_ids(self, exp):
+        """Maps ids to feature names.
+        Args:
+            exp: list of tuples [(id, weight), (id,weight)]
+        Returns:
+            list of tuples (feature_name, weight)
+        """
+        names = self.exp_feature_names
+        if self.discretized_feature_names is not None:
+            names = self.discretized_feature_names
+        return [(names[x[0]], x[1]) for x in exp]
+
+    def visualize_instance_html(self,
+                                exp,
+                                label,
+                                div_name,
+                                exp_object_name,
+                                show_table=True,
+                                show_all=False):
+        """Shows the current example in a table format.
+        Args:
+             exp: list of tuples [(id, weight), (id,weight)]
+             label: label id (integer)
+             div_name: name of div object to be used for rendering(in js)
+             exp_object_name: name of js explanation object
+             show_table: if False, don't show table visualization.
+             show_all: if True, show zero-weighted features in the table.
+        """
+        if not show_table:
+            return ''
+        weights = [0] * len(self.feature_names)
+        for x in exp:
+            weights[x[0]] = x[1]
+        if self.feature_indexes is not None:
+            # Sparse case: only display the non-zero values and importances
+            fnames = [self.exp_feature_names[i] for i in self.feature_indexes]
+            fweights = [weights[i] for i in self.feature_indexes]
+            if show_all:
+                out_list = list(zip(fnames,
+                                    self.feature_values,
+                                    fweights))
+            else:
+                out_dict = dict(map(lambda x: (x[0], (x[1], x[2], x[3])),
+                                zip(self.feature_indexes,
+                                    fnames,
+                                    self.feature_values,
+                                    fweights)))
+                out_list = [out_dict.get(x[0], (str(x[0]), 0.0, 0.0)) for x in exp]
+        else:
+            out_list = list(zip(self.exp_feature_names,
+                                self.feature_values,
+                                weights))
+            if not show_all:
+                out_list = [out_list[x[0]] for x in exp]
+        ret = u'''
+            %s.show_raw_tabular(%s, %d, %s);
+        ''' % (exp_object_name, json.dumps(out_list, ensure_ascii=False), label, div_name)
+        return ret
 class LimeTabularExplainer(object):
     """Explains predictions on tabular (i.e. matrix) data.
     For numerical features, perturb them by sampling from a Normal(0,1) and
@@ -141,7 +227,6 @@ class LimeTabularExplainer(object):
                  random_state=None,
                  training_data_stats=None):
         """Init function.
-
         Args:
             training_data: numpy 2d array
             mode: "classification" or "regression"
@@ -254,6 +339,7 @@ class LimeTabularExplainer(object):
 
         self.feature_selection = feature_selection
         self.base = lime_base.LimeBase(kernel_fn, verbose, random_state=self.random_state)
+        print(self.base)
         self.class_names = class_names
 
         # Though set has no role to play if training data stats are provided
@@ -299,6 +385,8 @@ class LimeTabularExplainer(object):
     def explain_instance(self,
                          data_row,
                          predict_fn,
+                         data,
+                         inverse,
                          labels=(1,),
                          top_labels=None,
                          num_features=10,
@@ -307,12 +395,10 @@ class LimeTabularExplainer(object):
                          model_regressor=None,
                          sampling_method='gaussian'):
         """Generates explanations for a prediction.
-
         First, we generate neighborhood data by randomly perturbing features
         from the instance (see __data_inverse). We then learn locally weighted
         linear models on this neighborhood data to explain each of the classes
         in an interpretable way (see lime_base.py).
-
         Args:
             data_row: 1d numpy array or scipy.sparse matrix, corresponding to a row
             predict_fn: prediction function. For classifiers, this should be a
@@ -335,7 +421,6 @@ class LimeTabularExplainer(object):
                 and 'sample_weight' as a parameter to model_regressor.fit()
             sampling_method: Method to sample synthetic data. Defaults to Gaussian
                 sampling. Can also use Latin Hypercube Sampling.
-
         Returns:
             An Explanation object (see explanation.py) with the corresponding
             explanations.
@@ -343,7 +428,8 @@ class LimeTabularExplainer(object):
         if sp.sparse.issparse(data_row) and not sp.sparse.isspmatrix_csr(data_row):
             # Preventative code: if sparse, convert to csr format if not in csr format already
             data_row = data_row.tocsr()
-        data, inverse = self.__data_inverse(data_row, num_samples, sampling_method)
+        data = data
+        inverse = inverse
         if sp.sparse.issparse(data):
             # Note in sparse case we don't subtract mean since data would become dense
             scaled_data = data.multiply(self.scaler.scale_)
@@ -471,6 +557,110 @@ class LimeTabularExplainer(object):
             ret_exp.local_exp[0] = [(i, -1 * j) for i, j in ret_exp.local_exp[1]]
 
         return ret_exp
+
+
+    def data_inverse(self,
+                       data_row,
+                       num_samples,
+                       sampling_method):
+        """Generates a neighborhood around a prediction.
+        For numerical features, perturb them by sampling from a Normal(0,1) and
+        doing the inverse operation of mean-centering and scaling, according to
+        the means and stds in the training data. For categorical features,
+        perturb by sampling according to the training distribution, and making
+        a binary feature that is 1 when the value is the same as the instance
+        being explained.
+        Args:
+            data_row: 1d numpy array, corresponding to a row
+            num_samples: size of the neighborhood to learn the linear model
+            sampling_method: 'gaussian' or 'lhs'
+        Returns:
+            A tuple (data, inverse), where:
+                data: dense num_samples * K matrix, where categorical features
+                are encoded with either 0 (not equal to the corresponding value
+                in data_row) or 1. The first row is the original instance.
+                inverse: same as data, except the categorical features are not
+                binary, but categorical (as the original data)
+        """
+        is_sparse = sp.sparse.issparse(data_row)
+        if is_sparse:
+            num_cols = data_row.shape[1]
+            data = sp.sparse.csr_matrix((num_samples, num_cols), dtype=data_row.dtype)
+        else:
+            num_cols = data_row.shape[0]
+            data = np.zeros((num_samples, num_cols))
+        categorical_features = range(num_cols)
+        if self.discretizer is None:
+            instance_sample = data_row
+            scale = self.scaler.scale_
+            mean = self.scaler.mean_
+            if is_sparse:
+                # Perturb only the non-zero values
+                non_zero_indexes = data_row.nonzero()[1]
+                num_cols = len(non_zero_indexes)
+                instance_sample = data_row[:, non_zero_indexes]
+                scale = scale[non_zero_indexes]
+                mean = mean[non_zero_indexes]
+
+            if sampling_method == 'gaussian':
+                data = self.random_state.normal(0, 1, num_samples * num_cols
+                                                ).reshape(num_samples, num_cols)
+                data = np.array(data)
+            elif sampling_method == 'lhs':
+                data = lhs(num_cols, samples=num_samples
+                           ).reshape(num_samples, num_cols)
+                means = np.zeros(num_cols)
+                stdvs = np.array([1]*num_cols)
+                for i in range(num_cols):
+                    data[:, i] = norm(loc=means[i], scale=stdvs[i]).ppf(data[:, i])
+                data = np.array(data)
+            else:
+                warnings.warn('''Invalid input for sampling_method.
+                                 Defaulting to Gaussian sampling.''', UserWarning)
+                data = self.random_state.normal(0, 1, num_samples * num_cols
+                                                ).reshape(num_samples, num_cols)
+                data = np.array(data)
+
+            if self.sample_around_instance:
+                data = data * scale + instance_sample
+            else:
+                data = data * scale + mean
+            if is_sparse:
+                if num_cols == 0:
+                    data = sp.sparse.csr_matrix((num_samples,
+                                                 data_row.shape[1]),
+                                                dtype=data_row.dtype)
+                else:
+                    indexes = np.tile(non_zero_indexes, num_samples)
+                    indptr = np.array(
+                        range(0, len(non_zero_indexes) * (num_samples + 1),
+                              len(non_zero_indexes)))
+                    data_1d_shape = data.shape[0] * data.shape[1]
+                    data_1d = data.reshape(data_1d_shape)
+                    data = sp.sparse.csr_matrix(
+                        (data_1d, indexes, indptr),
+                        shape=(num_samples, data_row.shape[1]))
+            categorical_features = self.categorical_features
+            first_row = data_row
+        else:
+            first_row = self.discretizer.discretize(data_row)
+        data[0] = data_row.copy()
+        inverse = data.copy()
+        for column in categorical_features:
+            values = self.feature_values[column]
+            freqs = self.feature_frequencies[column]
+            inverse_column = self.random_state.choice(values, size=num_samples,
+                                                      replace=True, p=freqs)
+            binary_column = (inverse_column == first_row[column]).astype(int)
+            binary_column[0] = 1
+            inverse_column[0] = data[0, column]
+            data[:, column] = binary_column
+            inverse[:, column] = inverse_column
+        if self.discretizer is not None:
+            inverse[1:] = self.discretizer.undiscretize(inverse[1:])
+        inverse[0] = data_row
+        return data, inverse
+
 
     def __data_inverse(self,
                        data_row,
