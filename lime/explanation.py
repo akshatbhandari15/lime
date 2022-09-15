@@ -138,7 +138,7 @@ class Explanation(object):
             given by domain_mapper. Weight is a float.
         """
         label_to_use = label if self.mode == "classification" else self.dummy_label
-        ans = self.local_exp[label_to_use]
+        ans = self.local_exp[1]
         ans = [(x[0], float(x[1])) for x in ans]
         return ans
 
